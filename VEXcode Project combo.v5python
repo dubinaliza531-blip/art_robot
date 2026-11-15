@@ -1,1 +1,416 @@
-{"mode":"Text","hardwareTarget":"brain","textContent":"from vex import *\nimport urandom\nimport math\nimport sys\nimport _thread\n\n#region VEXcode Generated Robot Configuration\nfrom vex import *\nimport urandom\nimport math\n\n# Brain should be defined by default\nbrain=Brain()\n\n# Robot configuration code\n\n\n# wait for rotation sensor to fully initialize\nwait(30, MSEC)\n\n\n# Make random actually random\ndef initializeRandomSeed():\n    wait(100, MSEC)\n    random = brain.battery.voltage(MV) + brain.battery.current(CurrentUnits.AMP) * 100 + brain.timer.system_high_res()\n    urandom.seed(int(random))\n      \n# Set random seed \ninitializeRandomSeed()\n\n\ndef play_vexcode_sound(sound_name):\n    # Helper to make playing sounds from the V5 in VEXcode easier and\n    # keeps the code cleaner by making it clear what is happening.\n    print(\"VEXPlaySound:\" + sound_name)\n    wait(5, MSEC)\n\n# add a small delay to make sure we don't print in the middle of the REPL header\nwait(200, MSEC)\n# clear the console to make sure we don't have the REPL in the console\nprint(\"\\033[2J\")\n\n#endregion VEXcode Generated Robot Configuration\n\nmotor_group_x_motor_a = Motor(Ports.PORT9, GearSetting.RATIO_18_1, False)\nmotor_group_x_motor_b = Motor(Ports.PORT10, GearSetting.RATIO_18_1, False)\nmotor_group_x = MotorGroup(motor_group_x_motor_a, motor_group_x_motor_b)\n\nmotor_y = Motor(Ports.PORT1, GearSetting.RATIO_18_1, False)\nmotor_tool = Motor(Ports.PORT2, GearSetting.RATIO_18_1, False)\n\nrange_finder_a = Sonar(brain.three_wire_port.a)\nbumper_c = Bumper(brain.three_wire_port.c)\n\nX_MM_TO_DEG = 2.36 \nY_MM_TO_DEG = 2.93 \n\nDRAW_SPEED_RPM = 25 \nTRAVEL_SPEED_RPM = 60 \nHOMING_SPEED_RPM = 40 \n\nY_DRAW_SPEED_RPM = 35 \nY_TRAVEL_SPEED_RPM = 70 \n\nSONAR_TRIGGER_DISTANCE_MM = 100\n\nX_MAX_MM = 500\nY_MAX_MM = 180\n\nSLOWDOWN_DISTANCE_MM = 5.0 \n\ncurrent_x = 0.0\ncurrent_y = 0.0\npen_down = False\ngcode_buffer = []\ncurrent_line = 0\nis_running = False\nis_paused = False\nis_cancelled = False\nis_homed = False\nis_homing = False\nx_max_calibrated = X_MAX_MM\ny_max_calibrated = Y_MAX_MM\n\nlast_touch_state = False\nlast_redraw_counter = 0\nredraw_counter = 0\n\ngcode_queue = []\n\nBTN_HOME = (20, 180, 130, 50)\nBTN_START = (170, 180, 130, 50)\nBTN_PAUSE = (320, 180, 130, 50)\n\ndef serial_listener():\n    global gcode_buffer\n    buffer = \"\"\n    while True:\n        char = sys.stdin.read(1)\n        if char:\n            if char == '\\n' or char == '\\r':\n                cmd = buffer.strip()\n                if cmd:\n                    gcode_buffer.append(cmd)\n                    print(\"ok\")\n                buffer = \"\"\n            else:\n                buffer += char\n        else:\n            sleep(10)\n\ndef get_sonar_distance_mm():\n    try:\n        return range_finder_a.distance(DistanceUnits.IN) * 25.4\n    except:\n        return 9999\n\ndef is_x_max_endstop_triggered():\n    return get_sonar_distance_mm() > SONAR_TRIGGER_DISTANCE_MM\n\ndef is_y_min_endstop_triggered():\n    return bumper_c.pressing()\n\ndef stop_all_motors():\n    motor_group_x.stop()\n    motor_y.stop()\n    motor_tool.stop()\n\ndef home_axis_y():\n    global current_y, y_max_calibrated\n    brain.screen.clear_screen()\n    brain.screen.set_cursor(1, 1)\n    brain.screen.print(\"HOMING Y AXIS...\")\n    brain.screen.next_row()\n    brain.screen.print(\"Move to Y min (bottom)\")\n\n    motor_y.spin(REVERSE, HOMING_SPEED_RPM, RPM)\n    while not is_y_min_endstop_triggered():\n        wait(10, MSEC)\n    motor_y.stop()\n    wait(50, MSEC)\n\n    motor_y.set_position(Y_MAX_MM * Y_MM_TO_DEG, DEGREES)\n    current_y = Y_MAX_MM\n    y_max_calibrated = Y_MAX_MM\n\n    brain.screen.next_row()\n    brain.screen.print(\"Y homed: Y=0 at top\")\n    wait(1000, MSEC)\n    return True\n\ndef home_axis_x():\n    global current_x, x_max_calibrated\n    brain.screen.clear_screen()\n    brain.screen.set_cursor(1, 1)\n    brain.screen.print(\"HOMING X AXIS...\")\n    brain.screen.next_row()\n    brain.screen.print(\"Move to X min\")\n\n    motor_group_x.spin(REVERSE, HOMING_SPEED_RPM, RPM)\n    while not is_x_max_endstop_triggered():\n        wait(10, MSEC)\n    motor_group_x.stop()\n    wait(50, MSEC)\n\n    motor_group_x.spin_for(FORWARD, 30, DEGREES, 30, RPM, True)\n    motor_group_x.set_position(0, DEGREES)\n    current_x = 0\n    x_max_calibrated = X_MAX_MM\n\n    brain.screen.next_row()\n    brain.screen.print(\"X homing OK\")\n    wait(1000, MSEC)\n    return True\n\ndef home_all():\n    global is_homed, is_homing\n    if is_homing:\n        return False\n    is_homing = True\n    set_pen('up')\n    home_axis_y()\n    home_axis_x()\n    is_homed = True\n    is_homing = False\n    draw_full_screen()\n    return True\n\ndef move_to(x, y, is_travel=False):\n    global current_x, current_y\n    new_x = max(0, min(x_max_calibrated, x))\n    new_y = max(0, min(y_max_calibrated, y))\n\n    distance_to_target = math.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)\n\n    if is_travel:\n        base_speed_x = TRAVEL_SPEED_RPM\n        base_speed_y = Y_TRAVEL_SPEED_RPM\n    else:\n        base_speed_x = DRAW_SPEED_RPM\n        base_speed_y = Y_DRAW_SPEED_RPM\n\n    if distance_to_target < SLOWDOWN_DISTANCE_MM and not is_travel:\n        slowdown_factor = max(0.3, distance_to_target / SLOWDOWN_DISTANCE_MM)\n        speed_rpm_x = max(10, base_speed_x * slowdown_factor)\n        speed_rpm_y = max(15, base_speed_y * slowdown_factor)\n    else:\n        speed_rpm_x = base_speed_x\n        speed_rpm_y = base_speed_y\n\n    x_delta_deg = (new_x - current_x) * X_MM_TO_DEG\n    y_delta_deg = (new_y - current_y) * Y_MM_TO_DEG\n\n    if abs(x_delta_deg) < 1 and abs(y_delta_deg) < 1:\n        return True\n\n    if abs(x_delta_deg) >= 1 and abs(y_delta_deg) >= 1:\n        target_x = motor_group_x.position(DEGREES) + x_delta_deg\n        target_y = motor_y.position(DEGREES) - y_delta_deg\n        motor_group_x.spin_to_position(target_x, DEGREES, speed_rpm_x, RPM, False)\n        motor_y.spin_to_position(target_y, DEGREES, speed_rpm_y, RPM, True)\n    elif abs(x_delta_deg) >= 1:\n        target_x = motor_group_x.position(DEGREES) + x_delta_deg\n        motor_group_x.spin_to_position(target_x, DEGREES, speed_rpm_x, RPM, True)\n    elif abs(y_delta_deg) >= 1:\n        target_y = motor_y.position(DEGREES) - y_delta_deg\n        motor_y.spin_to_position(target_y, DEGREES, speed_rpm_y, RPM, True)\n\n    current_x = new_x\n    current_y = new_y\n    return True\n\ndef set_pen(state):\n    global pen_down\n    if state == 'down' and not pen_down:\n        motor_tool.spin_to_position(-90, DEGREES, 30, RPM, True)\n        pen_down = True\n    elif state == 'up' and pen_down:\n        motor_tool.spin_to_position(0, DEGREES, 30, RPM, True)\n        pen_down = False\n\ndef execute_gcode(command):\n    global current_x, current_y\n    if not command or command.startswith(';'):\n        return\n    parts = command.strip().split()\n    if not parts:\n        return\n    cmd = parts[0].upper()\n    x = None\n    y = None\n    \n    if cmd == 'G04':\n        for p in parts[1:]:\n            if p.upper().startswith('P'):\n                pause_time = float(p[1:])\n                wait(int(pause_time * 1000), MSEC)\n        return\n    \n    for p in parts[1:]:\n        if p.upper().startswith('X'):\n            x = float(p[1:])\n        elif p.upper().startswith('Y'):\n            y = float(p[1:])\n    \n    if cmd == 'G00':\n        new_x = x if x is not None else current_x\n        new_y = y if y is not None else current_y\n        move_to(new_x, new_y, True)\n    elif cmd == 'G01':\n        new_x = x if x is not None else current_x\n        new_y = y if y is not None else current_y\n        move_to(new_x, new_y, False)\n    elif cmd == 'M03':\n        set_pen('down')\n    elif cmd == 'M05':\n        set_pen('up')\n    elif cmd == 'G28':\n        move_to(0, 0, True)\n\ndef process_gcode_buffer():\n    global current_line, is_running, is_paused, is_cancelled\n    if not is_running or is_paused or is_cancelled:\n        return\n    if current_line < len(gcode_buffer):\n        cmd = gcode_buffer[current_line].strip()\n        if cmd and not cmd.startswith(';'):\n            execute_gcode(cmd)\n        current_line += 1\n        wait(20, MSEC)\n    else:\n        if len(gcode_buffer) > 0:\n            is_running = False\n            set_pen('up')\n            move_to(10, 10, True)\n\ndef draw_buttons():\n    brain.screen.set_font(FontType.MONO15)\n\n    brain.screen.set_fill_color(Color.PURPLE)\n    brain.screen.set_pen_color(Color.WHITE)\n    brain.screen.draw_rectangle(*BTN_HOME)\n    brain.screen.print_at(\"HOME\", x=BTN_HOME[0]+35, y=BTN_HOME[1]+32, opaque=False)\n\n    brain.screen.set_fill_color(Color.GREEN if is_running else Color.RED)\n    brain.screen.draw_rectangle(*BTN_START)\n    brain.screen.print_at(\"START\", x=BTN_START[0]+30, y=BTN_START[1]+32, opaque=False)\n\n    brain.screen.set_fill_color(Color.ORANGE if is_paused else Color.BLUE)\n    brain.screen.draw_rectangle(*BTN_PAUSE)\n    brain.screen.print_at(\"RESUME\" if is_paused else \"PAUSE\", x=BTN_PAUSE[0]+20, y=BTN_PAUSE[1]+32, opaque=False)\n\ndef draw_status_panel():\n    brain.screen.set_cursor(7, 2)\n    brain.screen.print(\"HOMED: {}\".format(\"YES\" if is_homed else \"NO \"))\n    brain.screen.set_cursor(8, 2)\n    brain.screen.print(\"X: {:.1f} Y: {:.1f} \".format(current_x, current_y))\n    brain.screen.set_cursor(9, 2)\n    brain.screen.print(\"PEN: {}\".format(\"DOWN\" if pen_down else \"UP \"))\n    brain.screen.set_cursor(14, 2)\n    brain.screen.print(\"Queue lines: {}\".format(len(gcode_buffer)))\n\n    if len(gcode_buffer) > 0 and current_line < len(gcode_buffer):\n        brain.screen.set_cursor(18, 1)\n        cmd = gcode_buffer[current_line][:35]\n        brain.screen.print(\"CMD: {}\".format(cmd))\n\n    brain.screen.set_cursor(20, 1)\n    if is_running:\n        if is_paused:\n            brain.screen.print(\"STATUS: PAUSED \")\n        else:\n            brain.screen.print(\"STATUS: DRAWING \")\n    else:\n        brain.screen.print(\"STATUS: READY \")\n\ndef draw_full_screen():\n    brain.screen.clear_screen()\n    brain.screen.set_font(FontType.MONO12)\n    brain.screen.set_cursor(1, 1)\n    brain.screen.print(\"=== VEX V5 PLOTTER ===\")\n    draw_buttons()\n    draw_status_panel()\n\ndef on_home():\n    brain.screen.set_cursor(21, 1)\n    brain.screen.print(\"Calibrating...    \")\n    home_all()\n\ndef on_start():\n    global is_running, is_paused, is_cancelled, current_line\n    if not is_homed:\n        brain.screen.set_cursor(21, 1)\n        brain.screen.print(\"HOME first!       \")\n        wait(500, MSEC)\n        return\n    if len(gcode_buffer) == 0:\n        brain.screen.set_cursor(21, 1)\n        brain.screen.print(\"No G-code!        \")\n        wait(500, MSEC)\n        return\n    is_cancelled = False\n    is_running = not is_running\n    is_paused = False\n\ndef on_pause():\n    global is_paused, is_running\n    if is_running:\n        is_paused = not is_paused\n        if is_paused:\n            stop_all_motors()\n\ndef main():\n    global last_touch_state, last_redraw_counter, redraw_counter\n\n    motor_group_x.set_position(0, DEGREES)\n    motor_y.set_position(0, DEGREES)\n    motor_tool.set_position(0, DEGREES)\n\n    motor_group_x.set_stopping(BrakeType.BRAKE)\n    motor_y.set_stopping(BrakeType.HOLD)\n    motor_tool.set_stopping(BrakeType.HOLD)\n\n    set_pen('up')\n\n    _thread.start_new_thread(serial_listener, ())\n\n    draw_full_screen()\n\n    while True:\n        redraw_counter += 1\n        draw_status_panel()\n\n        if redraw_counter - last_redraw_counter > 100:\n            draw_buttons()\n            last_redraw_counter = redraw_counter\n\n        touching = brain.screen.pressing()\n        if touching and not last_touch_state:\n            x = brain.screen.x_position()\n            y = brain.screen.y_position()\n            \n            if BTN_HOME[0] <= x <= BTN_HOME[0] + BTN_HOME[2] and BTN_HOME[1] <= y <= BTN_HOME[1] + BTN_HOME[3]:\n                on_home()\n            elif BTN_START[0] <= x <= BTN_START[0] + BTN_START[2] and BTN_START[1] <= y <= BTN_START[1] + BTN_START[3]:\n                on_start()\n            elif BTN_PAUSE[0] <= x <= BTN_PAUSE[0] + BTN_PAUSE[2] and BTN_PAUSE[1] <= y <= BTN_PAUSE[1] + BTN_PAUSE[3]:\n                on_pause()\n\n        last_touch_state = touching\n        process_gcode_buffer()\n\n        wait(50, MSEC)\n\nif __name__ == \"__main__\":\n    main()","textLanguage":"python","robotConfig":[],"slot":0,"platform":"V5","sdkVersion":"20240802.15.00.00","appVersion":"4.67.0","fileFormat":"2.0.0","targetBrainGen":"First","v5Sounds":[{"name":"game over","url":"static/sounds/mixkit-arcade-retro-game-over-213.wav"}],"v5SoundsEnabled":false,"aiVisionSettings":{"colors":[],"codes":[],"tags":true,"AIObjects":true,"AIObjectModel":[],"aiModelDropDownValue":null}}
+from vex import *
+import urandom
+import math
+import sys
+import _thread
+
+#region VEXcode Generated Robot Configuration
+from vex import *
+import urandom
+import math
+
+# Brain should be defined by default
+brain=Brain()
+
+# Robot configuration code
+
+
+# wait for rotation sensor to fully initialize
+wait(30, MSEC)
+
+
+# Make random actually random
+def initializeRandomSeed():
+    wait(100, MSEC)
+    random = brain.battery.voltage(MV) + brain.battery.current(CurrentUnits.AMP) * 100 + brain.timer.system_high_res()
+    urandom.seed(int(random))
+      
+# Set random seed 
+initializeRandomSeed()
+
+
+def play_vexcode_sound(sound_name):
+    # Helper to make playing sounds from the V5 in VEXcode easier and
+    # keeps the code cleaner by making it clear what is happening.
+    print("VEXPlaySound:" + sound_name)
+    wait(5, MSEC)
+
+# add a small delay to make sure we don't print in the middle of the REPL header
+wait(200, MSEC)
+# clear the console to make sure we don't have the REPL in the console
+print("\033[2J")
+
+#endregion VEXcode Generated Robot Configuration
+
+motor_group_x_motor_a = Motor(Ports.PORT9, GearSetting.RATIO_18_1, False)
+motor_group_x_motor_b = Motor(Ports.PORT10, GearSetting.RATIO_18_1, False)
+motor_group_x = MotorGroup(motor_group_x_motor_a, motor_group_x_motor_b)
+
+motor_y = Motor(Ports.PORT1, GearSetting.RATIO_18_1, False)
+motor_tool = Motor(Ports.PORT2, GearSetting.RATIO_18_1, False)
+
+range_finder_a = Sonar(brain.three_wire_port.a)
+bumper_c = Bumper(brain.three_wire_port.c)
+
+X_MM_TO_DEG = 2.36 
+Y_MM_TO_DEG = 2.93 
+
+DRAW_SPEED_RPM = 25 
+TRAVEL_SPEED_RPM = 60 
+HOMING_SPEED_RPM = 40 
+
+Y_DRAW_SPEED_RPM = 35 
+Y_TRAVEL_SPEED_RPM = 70 
+
+SONAR_TRIGGER_DISTANCE_MM = 100
+
+X_MAX_MM = 500
+Y_MAX_MM = 180
+
+SLOWDOWN_DISTANCE_MM = 5.0 
+
+current_x = 0.0
+current_y = 0.0
+pen_down = False
+gcode_buffer = []
+current_line = 0
+is_running = False
+is_paused = False
+is_cancelled = False
+is_homed = False
+is_homing = False
+x_max_calibrated = X_MAX_MM
+y_max_calibrated = Y_MAX_MM
+
+last_touch_state = False
+last_redraw_counter = 0
+redraw_counter = 0
+
+gcode_queue = []
+
+BTN_HOME = (20, 180, 130, 50)
+BTN_START = (170, 180, 130, 50)
+BTN_PAUSE = (320, 180, 130, 50)
+
+def serial_listener():
+    global gcode_buffer
+    buffer = ""
+    while True:
+        char = sys.stdin.read(1)
+        if char:
+            if char == '\n' or char == '\r':
+                cmd = buffer.strip()
+                if cmd:
+                    gcode_buffer.append(cmd)
+                    print("ok")
+                buffer = ""
+            else:
+                buffer += char
+        else:
+            sleep(10)
+
+def get_sonar_distance_mm():
+    try:
+        return range_finder_a.distance(DistanceUnits.IN) * 25.4
+    except:
+        return 9999
+
+def is_x_max_endstop_triggered():
+    return get_sonar_distance_mm() > SONAR_TRIGGER_DISTANCE_MM
+
+def is_y_min_endstop_triggered():
+    return bumper_c.pressing()
+
+def stop_all_motors():
+    motor_group_x.stop()
+    motor_y.stop()
+    motor_tool.stop()
+
+def home_axis_y():
+    global current_y, y_max_calibrated
+    brain.screen.clear_screen()
+    brain.screen.set_cursor(1, 1)
+    brain.screen.print("HOMING Y AXIS...")
+    brain.screen.next_row()
+    brain.screen.print("Move to Y min (bottom)")
+
+    motor_y.spin(REVERSE, HOMING_SPEED_RPM, RPM)
+    while not is_y_min_endstop_triggered():
+        wait(10, MSEC)
+    motor_y.stop()
+    wait(50, MSEC)
+
+    motor_y.set_position(Y_MAX_MM * Y_MM_TO_DEG, DEGREES)
+    current_y = Y_MAX_MM
+    y_max_calibrated = Y_MAX_MM
+
+    brain.screen.next_row()
+    brain.screen.print("Y homed: Y=0 at top")
+    wait(1000, MSEC)
+    return True
+
+def home_axis_x():
+    global current_x, x_max_calibrated
+    brain.screen.clear_screen()
+    brain.screen.set_cursor(1, 1)
+    brain.screen.print("HOMING X AXIS...")
+    brain.screen.next_row()
+    brain.screen.print("Move to X min")
+
+    motor_group_x.spin(REVERSE, HOMING_SPEED_RPM, RPM)
+    while not is_x_max_endstop_triggered():
+        wait(10, MSEC)
+    motor_group_x.stop()
+    wait(50, MSEC)
+
+    motor_group_x.spin_for(FORWARD, 30, DEGREES, 30, RPM, True)
+    motor_group_x.set_position(0, DEGREES)
+    current_x = 0
+    x_max_calibrated = X_MAX_MM
+
+    brain.screen.next_row()
+    brain.screen.print("X homing OK")
+    wait(1000, MSEC)
+    return True
+
+def home_all():
+    global is_homed, is_homing
+    if is_homing:
+        return False
+    is_homing = True
+    set_pen('up')
+    home_axis_y()
+    home_axis_x()
+    is_homed = True
+    is_homing = False
+    draw_full_screen()
+    return True
+
+def move_to(x, y, is_travel=False):
+    global current_x, current_y
+    new_x = max(0, min(x_max_calibrated, x))
+    new_y = max(0, min(y_max_calibrated, y))
+
+    distance_to_target = math.sqrt((new_x - current_x)**2 + (new_y - current_y)**2)
+
+    if is_travel:
+        base_speed_x = TRAVEL_SPEED_RPM
+        base_speed_y = Y_TRAVEL_SPEED_RPM
+    else:
+        base_speed_x = DRAW_SPEED_RPM
+        base_speed_y = Y_DRAW_SPEED_RPM
+
+    if distance_to_target < SLOWDOWN_DISTANCE_MM and not is_travel:
+        slowdown_factor = max(0.3, distance_to_target / SLOWDOWN_DISTANCE_MM)
+        speed_rpm_x = max(10, base_speed_x * slowdown_factor)
+        speed_rpm_y = max(15, base_speed_y * slowdown_factor)
+    else:
+        speed_rpm_x = base_speed_x
+        speed_rpm_y = base_speed_y
+
+    x_delta_deg = (new_x - current_x) * X_MM_TO_DEG
+    y_delta_deg = (new_y - current_y) * Y_MM_TO_DEG
+
+    if abs(x_delta_deg) < 1 and abs(y_delta_deg) < 1:
+        return True
+
+    if abs(x_delta_deg) >= 1 and abs(y_delta_deg) >= 1:
+        target_x = motor_group_x.position(DEGREES) + x_delta_deg
+        target_y = motor_y.position(DEGREES) - y_delta_deg
+        motor_group_x.spin_to_position(target_x, DEGREES, speed_rpm_x, RPM, False)
+        motor_y.spin_to_position(target_y, DEGREES, speed_rpm_y, RPM, True)
+    elif abs(x_delta_deg) >= 1:
+        target_x = motor_group_x.position(DEGREES) + x_delta_deg
+        motor_group_x.spin_to_position(target_x, DEGREES, speed_rpm_x, RPM, True)
+    elif abs(y_delta_deg) >= 1:
+        target_y = motor_y.position(DEGREES) - y_delta_deg
+        motor_y.spin_to_position(target_y, DEGREES, speed_rpm_y, RPM, True)
+
+    current_x = new_x
+    current_y = new_y
+    return True
+
+def set_pen(state):
+    global pen_down
+    if state == 'down' and not pen_down:
+        motor_tool.spin_to_position(-90, DEGREES, 30, RPM, True)
+        pen_down = True
+    elif state == 'up' and pen_down:
+        motor_tool.spin_to_position(0, DEGREES, 30, RPM, True)
+        pen_down = False
+
+def execute_gcode(command):
+    global current_x, current_y
+    if not command or command.startswith(';'):
+        return
+    parts = command.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].upper()
+    x = None
+    y = None
+    
+    if cmd == 'G04':
+        for p in parts[1:]:
+            if p.upper().startswith('P'):
+                pause_time = float(p[1:])
+                wait(int(pause_time * 1000), MSEC)
+        return
+    
+    for p in parts[1:]:
+        if p.upper().startswith('X'):
+            x = float(p[1:])
+        elif p.upper().startswith('Y'):
+            y = float(p[1:])
+    
+    if cmd == 'G00':
+        new_x = x if x is not None else current_x
+        new_y = y if y is not None else current_y
+        move_to(new_x, new_y, True)
+    elif cmd == 'G01':
+        new_x = x if x is not None else current_x
+        new_y = y if y is not None else current_y
+        move_to(new_x, new_y, False)
+    elif cmd == 'M03':
+        set_pen('down')
+    elif cmd == 'M05':
+        set_pen('up')
+    elif cmd == 'G28':
+        move_to(0, 0, True)
+
+def process_gcode_buffer():
+    global current_line, is_running, is_paused, is_cancelled
+    if not is_running or is_paused or is_cancelled:
+        return
+    if current_line < len(gcode_buffer):
+        cmd = gcode_buffer[current_line].strip()
+        if cmd and not cmd.startswith(';'):
+            execute_gcode(cmd)
+        current_line += 1
+        wait(20, MSEC)
+    else:
+        if len(gcode_buffer) > 0:
+            is_running = False
+            set_pen('up')
+            move_to(10, 10, True)
+
+def draw_buttons():
+    brain.screen.set_font(FontType.MONO15)
+
+    brain.screen.set_fill_color(Color.PURPLE)
+    brain.screen.set_pen_color(Color.WHITE)
+    brain.screen.draw_rectangle(*BTN_HOME)
+    brain.screen.print_at("HOME", x=BTN_HOME[0]+35, y=BTN_HOME[1]+32, opaque=False)
+
+    brain.screen.set_fill_color(Color.GREEN if is_running else Color.RED)
+    brain.screen.draw_rectangle(*BTN_START)
+    brain.screen.print_at("START", x=BTN_START[0]+30, y=BTN_START[1]+32, opaque=False)
+
+    brain.screen.set_fill_color(Color.ORANGE if is_paused else Color.BLUE)
+    brain.screen.draw_rectangle(*BTN_PAUSE)
+    brain.screen.print_at("RESUME" if is_paused else "PAUSE", x=BTN_PAUSE[0]+20, y=BTN_PAUSE[1]+32, opaque=False)
+
+def draw_status_panel():
+    brain.screen.set_cursor(7, 2)
+    brain.screen.print("HOMED: {}".format("YES" if is_homed else "NO "))
+    brain.screen.set_cursor(8, 2)
+    brain.screen.print("X: {:.1f} Y: {:.1f} ".format(current_x, current_y))
+    brain.screen.set_cursor(9, 2)
+    brain.screen.print("PEN: {}".format("DOWN" if pen_down else "UP "))
+    brain.screen.set_cursor(14, 2)
+    brain.screen.print("Queue lines: {}".format(len(gcode_buffer)))
+
+    if len(gcode_buffer) > 0 and current_line < len(gcode_buffer):
+        brain.screen.set_cursor(18, 1)
+        cmd = gcode_buffer[current_line][:35]
+        brain.screen.print("CMD: {}".format(cmd))
+
+    brain.screen.set_cursor(20, 1)
+    if is_running:
+        if is_paused:
+            brain.screen.print("STATUS: PAUSED ")
+        else:
+            brain.screen.print("STATUS: DRAWING ")
+    else:
+        brain.screen.print("STATUS: READY ")
+
+def draw_full_screen():
+    brain.screen.clear_screen()
+    brain.screen.set_font(FontType.MONO12)
+    brain.screen.set_cursor(1, 1)
+    brain.screen.print("=== VEX V5 PLOTTER ===")
+    draw_buttons()
+    draw_status_panel()
+
+def on_home():
+    brain.screen.set_cursor(21, 1)
+    brain.screen.print("Calibrating...    ")
+    home_all()
+
+def on_start():
+    global is_running, is_paused, is_cancelled, current_line
+    if not is_homed:
+        brain.screen.set_cursor(21, 1)
+        brain.screen.print("HOME first!       ")
+        wait(500, MSEC)
+        return
+    if len(gcode_buffer) == 0:
+        brain.screen.set_cursor(21, 1)
+        brain.screen.print("No G-code!        ")
+        wait(500, MSEC)
+        return
+    is_cancelled = False
+    is_running = not is_running
+    is_paused = False
+
+def on_pause():
+    global is_paused, is_running
+    if is_running:
+        is_paused = not is_paused
+        if is_paused:
+            stop_all_motors()
+
+def main():
+    global last_touch_state, last_redraw_counter, redraw_counter
+
+    motor_group_x.set_position(0, DEGREES)
+    motor_y.set_position(0, DEGREES)
+    motor_tool.set_position(0, DEGREES)
+
+    motor_group_x.set_stopping(BrakeType.BRAKE)
+    motor_y.set_stopping(BrakeType.HOLD)
+    motor_tool.set_stopping(BrakeType.HOLD)
+
+    set_pen('up')
+
+    _thread.start_new_thread(serial_listener, ())
+
+    draw_full_screen()
+
+    while True:
+        redraw_counter += 1
+        draw_status_panel()
+
+        if redraw_counter - last_redraw_counter > 100:
+            draw_buttons()
+            last_redraw_counter = redraw_counter
+
+        touching = brain.screen.pressing()
+        if touching and not last_touch_state:
+            x = brain.screen.x_position()
+            y = brain.screen.y_position()
+            
+            if BTN_HOME[0] <= x <= BTN_HOME[0] + BTN_HOME[2] and BTN_HOME[1] <= y <= BTN_HOME[1] + BTN_HOME[3]:
+                on_home()
+            elif BTN_START[0] <= x <= BTN_START[0] + BTN_START[2] and BTN_START[1] <= y <= BTN_START[1] + BTN_START[3]:
+                on_start()
+            elif BTN_PAUSE[0] <= x <= BTN_PAUSE[0] + BTN_PAUSE[2] and BTN_PAUSE[1] <= y <= BTN_PAUSE[1] + BTN_PAUSE[3]:
+                on_pause()
+
+        last_touch_state = touching
+        process_gcode_buffer()
+
+        wait(50, MSEC)
+
+if __name__ == "__main__":
+    main()
